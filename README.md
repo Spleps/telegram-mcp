@@ -72,6 +72,17 @@ owner_only -> commands -> store_in_inbox
 
 Add your own middleware as `def mw(ctx, nxt)` and put it into `MIDDLEWARES`.
 
+## Tests
+
+Offline tests (no network, no real config) cover the middleware chain, access control,
+commands, `pull_updates` with a fake Telegram API, and the file helpers:
+
+```
+python -m unittest discover -s tests -v
+```
+
+They also run on GitHub Actions on every push.
+
 ## Notes
 
 - Bot API limits: download ≤ 20 MB, upload ≤ 50 MB.
