@@ -49,6 +49,15 @@ Start a new Claude session and the `bot_*` / `tg_*` tools appear. Downloaded fil
 - Account: Telegram → Settings → Devices → terminate the session.
 - Bot: `/revoke` in @BotFather, then run `setup.py` again.
 
+## Bot commands
+
+While the MCP server is running (i.e. a Claude session is open), the bot long-polls in the background and answers instantly:
+
+- `/help`: what the bot can do
+- `/status`: how many messages are waiting for Claude
+
+When no session is open, messages are not lost: Telegram keeps undelivered updates for 24 hours and the bot picks them up on the next start.
+
 ## Notes
 
 - Bot API limits: download ≤ 20 MB, upload ≤ 50 MB.

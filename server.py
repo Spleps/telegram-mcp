@@ -9,6 +9,8 @@ Secrets live in config.json and account.session next to this file; both are crea
 import json
 import os
 import re
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -99,32 +101,110 @@ def describe_bot_message(m: dict) -> dict:
     return item
 
 
-def pull_updates() -> int:
-    state = json.loads(STATE.read_text()) if STATE.exists() else {}
-    offset = state.get("offset", 0)
-    updates = bot_api("getUpdates", json={"offset": offset, "timeout": 0})
+HELP_TEXT = (
+    "Я бот-помощник для Claude. Всё, что ты сюда пишешь или пересылаешь, Claude видит в своей сессии.\n\n"
+    "Что можно делать:\n"
+    "• Пересылать фото методичек, PDF, файлы: Claude их скачает и использует (до 20 МБ).\n"
+    "• Писать заметки или задания: «сделай лабу 4 по физике».\n"
+    "• Получать от Claude готовые отчёты и напоминания.\n\n"
+    "Потом в Claude напиши, например: «возьми файлы из бота».\n\n"
+    "Команды:\n"
+    "/help: эта справка\n"
+    "/status: сколько сообщений ждёт Claude\n\n"
+    "Бот отвечает на команды только пока открыта сессия Claude, но сообщения не теряются: "
+    "Telegram хранит их до 24 часов."
+)
+COMMANDS = [
+    {"command": "help", "description": "Что умеет бот"},
+    {"command": "status", "description": "Сколько сообщений ждёт Claude"},
+]
+
+_lock = threading.Lock()
+_poller_alive = False
+
+
+def _state() -> dict:
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+
+
+def _inbox_lines() -> list:
+    return INBOX.read_text(encoding="utf-8").splitlines() if INBOX.exists() else []
+
+
+def _reply(chat_id: int, text: str):
+    try:
+        bot_api("sendMessage", json={"chat_id": chat_id, "text": text})
+    except Exception:
+        pass
+
+
+def pull_updates(timeout: int = 0) -> int:
+    """One getUpdates round: answers commands, stores owner messages. Returns stored count."""
+    with _lock:
+        offset = _state().get("offset", 0)
+    updates = bot_api("getUpdates", json={"offset": offset, "timeout": timeout})
     oid = owner_id()
     added = 0
-    with INBOX.open("a", encoding="utf-8") as f:
-        for u in updates:
-            offset = max(offset, u["update_id"] + 1)
-            m = u.get("message")
-            if not m or m.get("chat", {}).get("id") != oid:
-                continue  # ignore everyone except the owner
-            f.write(json.dumps(describe_bot_message(m), ensure_ascii=False) + "\n")
-            added += 1
-    STATE.write_text(json.dumps({"offset": offset}))
+    with _lock:
+        st = _state()
+        with INBOX.open("a", encoding="utf-8") as f:
+            for u in updates:
+                offset = max(offset, u["update_id"] + 1)
+                m = u.get("message")
+                if not m:
+                    continue
+                chat = m.get("chat", {}).get("id")
+                text = (m.get("text") or "").strip()
+                if chat != oid:
+                    if text.startswith("/"):
+                        _reply(chat, "Это приватный бот.")
+                    continue  # ignore everyone except the owner
+                cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+                if cmd in ("/help", "/start"):
+                    _reply(chat, HELP_TEXT)
+                    continue
+                if cmd == "/status":
+                    waiting = len(_inbox_lines()) + added - st.get("seen", 0)
+                    _reply(chat, f"Ждут Claude: {max(waiting, 0)} сообщ.")
+                    continue
+                f.write(json.dumps(describe_bot_message(m), ensure_ascii=False) + "\n")
+                added += 1
+        st["offset"] = offset
+        STATE.write_text(json.dumps(st))
     return added
+
+
+def _poll_forever():
+    """Background long polling while the MCP server runs, so /help gets an instant answer."""
+    global _poller_alive
+    try:
+        if not cfg().get("bot_token") or not cfg().get("owner_chat_id"):
+            return
+        bot_api("setMyCommands", json={"commands": COMMANDS})
+    except Exception:
+        return
+    _poller_alive = True
+    while True:
+        try:
+            pull_updates(timeout=25)
+        except Exception:
+            time.sleep(5)  # network error or another session is polling (409)
 
 
 @mcp.tool()
 def bot_inbox(limit: int = 20) -> str:
-    """Fetch new messages the owner sent/forwarded to the bot and return the last `limit` inbox items
-    (text, forwarded-from, attached files with file_id). Use bot_download to save a file."""
-    added = pull_updates()
-    lines = INBOX.read_text(encoding="utf-8").splitlines() if INBOX.exists() else []
+    """Return the last `limit` messages the owner sent/forwarded to the bot (text, forwarded-from,
+    attached files with file_id) and how many are new since the last call. Use bot_download to save a file."""
+    if not _poller_alive:
+        pull_updates()
+    with _lock:
+        lines = _inbox_lines()
+        st = _state()
+        new = len(lines) - st.get("seen", 0)
+        st["seen"] = len(lines)
+        STATE.write_text(json.dumps(st))
     items = [json.loads(x) for x in lines[-limit:]]
-    return json.dumps({"new": added, "items": items}, ensure_ascii=False, indent=1)
+    return json.dumps({"new": max(new, 0), "items": items}, ensure_ascii=False, indent=1)
 
 
 @mcp.tool()
@@ -275,4 +355,5 @@ async def tg_download(chat: str, message_id: int) -> str:
 
 
 if __name__ == "__main__":
+    threading.Thread(target=_poll_forever, daemon=True).start()
     mcp.run()
