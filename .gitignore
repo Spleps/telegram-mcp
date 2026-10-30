@@ -1,0 +1,13 @@
+# secrets and local state: never commit
+config.json
+*.session
+*.session-journal
+inbox.jsonl
+state.json
+login_qr.png
+tg_login_qr_*.png
+
+# python
+__pycache__/
+*.pyc
+.venv/

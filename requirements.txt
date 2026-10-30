@@ -1,0 +1,5 @@
+mcp>=2.3
+telethon>=1.45
+httpx
+qrcode[pil]
+cryptg  # optional, faster Telethon encryption
