@@ -58,6 +58,20 @@ While the MCP server is running (i.e. a Claude session is open), the bot long-po
 
 When no session is open, messages are not lost: Telegram keeps undelivered updates for 24 hours and the bot picks them up on the next start.
 
+## How updates are handled
+
+Every incoming message goes through a middleware chain in `server.py`:
+
+```
+owner_only -> commands -> store_in_inbox
+```
+
+- `owner_only`: access control. Messages from anyone except `owner_chat_id` stop here (commands get "Это приватный бот.").
+- `commands`: answers `/help`, `/start`, `/status`.
+- `store_in_inbox`: saves everything else for `bot_inbox`.
+
+Add your own middleware as `def mw(ctx, nxt)` and put it into `MIDDLEWARES`.
+
 ## Notes
 
 - Bot API limits: download ≤ 20 MB, upload ≤ 50 MB.

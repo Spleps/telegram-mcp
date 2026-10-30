@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 import httpx
 from mcp.server.mcpserver import MCPServer
@@ -138,8 +139,72 @@ def _reply(chat_id: int, text: str):
         pass
 
 
+# ------------------------------------------------ update pipeline (middleware)
+#
+# Every incoming message goes through a chain: each middleware gets the context and `nxt`
+# (the rest of the chain). It can handle the message and stop, or call nxt(ctx) to pass it on.
+#
+#   owner_only -> commands -> store_in_inbox
+#
+# The owner check sits first, so nothing after it ever sees a stranger's message.
+
+class Ctx:
+    def __init__(self, message: dict, owner: int, state: dict, inbox):
+        self.message = message
+        self.chat_id = message.get("chat", {}).get("id")
+        self.text = (message.get("text") or "").strip()
+        self.cmd = self.text.split()[0].split("@")[0].lower() if self.text.startswith("/") else ""
+        self.owner = owner
+        self.state = state
+        self.inbox = inbox
+        self.added = 0
+
+
+Handler = Callable[[Ctx], None]
+Middleware = Callable[[Ctx, Handler], None]
+
+
+def owner_only(ctx: Ctx, nxt: Handler):
+    """Access control: only the owner's messages go further."""
+    if ctx.chat_id != ctx.owner:
+        if ctx.cmd:
+            _reply(ctx.chat_id, "Это приватный бот.")
+        return
+    nxt(ctx)
+
+
+def commands(ctx: Ctx, nxt: Handler):
+    """Bot commands are answered here and are not stored for Claude."""
+    if ctx.cmd in ("/help", "/start"):
+        _reply(ctx.chat_id, HELP_TEXT)
+    elif ctx.cmd == "/status":
+        waiting = len(_inbox_lines()) + ctx.added - ctx.state.get("seen", 0)
+        _reply(ctx.chat_id, f"Ждут Claude: {max(waiting, 0)} сообщ.")
+    else:
+        nxt(ctx)
+
+
+def store_in_inbox(ctx: Ctx):
+    """Final handler: save the message for Claude (bot_inbox)."""
+    ctx.inbox.write(json.dumps(describe_bot_message(ctx.message), ensure_ascii=False) + "\n")
+    ctx.added += 1
+
+
+MIDDLEWARES: list = [owner_only, commands]
+
+
+def build_pipeline(middlewares: list, final: Handler) -> Handler:
+    handler = final
+    for mw in reversed(middlewares):
+        handler = (lambda m, n: lambda ctx: m(ctx, n))(mw, handler)
+    return handler
+
+
+PIPELINE = build_pipeline(MIDDLEWARES, store_in_inbox)
+
+
 def pull_updates(timeout: int = 0) -> int:
-    """One getUpdates round: answers commands, stores owner messages. Returns stored count."""
+    """One getUpdates round: runs every message through PIPELINE. Returns stored count."""
     with _lock:
         offset = _state().get("offset", 0)
     updates = bot_api("getUpdates", json={"offset": offset, "timeout": timeout})
@@ -153,22 +218,10 @@ def pull_updates(timeout: int = 0) -> int:
                 m = u.get("message")
                 if not m:
                     continue
-                chat = m.get("chat", {}).get("id")
-                text = (m.get("text") or "").strip()
-                if chat != oid:
-                    if text.startswith("/"):
-                        _reply(chat, "Это приватный бот.")
-                    continue  # ignore everyone except the owner
-                cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
-                if cmd in ("/help", "/start"):
-                    _reply(chat, HELP_TEXT)
-                    continue
-                if cmd == "/status":
-                    waiting = len(_inbox_lines()) + added - st.get("seen", 0)
-                    _reply(chat, f"Ждут Claude: {max(waiting, 0)} сообщ.")
-                    continue
-                f.write(json.dumps(describe_bot_message(m), ensure_ascii=False) + "\n")
-                added += 1
+                ctx = Ctx(m, oid, st, f)
+                ctx.added = added
+                PIPELINE(ctx)
+                added = ctx.added
         st["offset"] = offset
         STATE.write_text(json.dumps(st))
     return added
